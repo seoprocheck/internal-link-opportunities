@@ -72,6 +72,9 @@ python3 internal_link_opportunities.py --selftest
 
 ## Reading the output honestly
 
+**Chrome is detected by class, not just by tag.** Most CMS themes build menus, related-post rails and share bars out of plain `<div>`s rather than `<nav>`. Tested against a live WordPress site, tag-only detection counted **341 "content" links and 261 list items on every page** — identical figures across pages, which is the signature of template markup. Class/id/role detection brings that to 37 links and 3–12 list items. `entry-header` and `post-header` are deliberately *not* treated as chrome, because that is where most themes put the H1.
+
+
 **It matches words, not meaning.** A page about jaguars the animal will match a sentence about Jaguars the car. Read the sentence before pasting the link — that is why the sentence is printed.
 
 **Your H1s are the input.** Each page's subject comes from its H1, falling back to `<title>`. Vague headings produce vague matches; a site with "Welcome" as half its H1s will get poor results, which is itself worth knowing.

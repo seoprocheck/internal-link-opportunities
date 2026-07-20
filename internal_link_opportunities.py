@@ -33,6 +33,33 @@ from html.parser import HTMLParser
 UA = "internal-link-opportunities/1.0 (+https://github.com/seoprocheck/internal-link-opportunities)"
 CHROME_TAGS = {"script", "style", "nav", "header", "footer", "aside", "form",
                "noscript", "svg", "template", "button", "select"}
+
+# Tag-based detection alone is not enough: most CMS themes build their menus,
+# related-post rails and share bars out of plain <div>s. Measured on a real
+# WordPress site that leaked ~340 nav links and ~260 menu list items into every
+# page's "content" counts.
+CHROME_CONTAINERS = {"div", "section", "ul", "ol", "aside", "span", "table"}
+CHROME_HINT = re.compile(
+    r"(^|[-_ ])("
+    r"nav(bar|igation)?|(sub|main|primary|top)?menu|breadcrumbs?|pagination|pager|"
+    r"sidebar|widgets?|footer|(site|global|page|main)[-_]header|masthead|banner|"
+    r"related|recirc|share|social|subscribe|newsletter|cookie|consent|promo|popup|"
+    r"modal|offcanvas|drawer|comments?|disqus|toc|tableofcontents|skip|screen-reader"
+    r")([-_ ]|$)", re.I)
+VOID_TAGS = {"br", "hr", "img", "input", "meta", "link", "source", "track", "wbr",
+             "col", "area", "base", "embed", "param"}
+
+
+def is_chrome_attrs(attrs):
+    """Site chrome by class/id/role. Deliberately does NOT match entry-header or
+    post-header — those hold the H1 on most themes."""
+    blob = " ".join(filter(None, (attrs.get("class"), attrs.get("id"), attrs.get("role"))))
+    if not blob:
+        return False
+    if attrs.get("role") in ("navigation", "banner", "contentinfo", "complementary", "search"):
+        return True
+    return bool(CHROME_HINT.search(blob))
+
 BLOCK_TAGS = {"p", "li", "td", "th", "blockquote", "dd", "dt"}
 HEADING_TAGS = {"h1", "h2", "h3"}
 MIN_TERMS = 2          # a topic needs this many distinctive words to be matchable
@@ -52,6 +79,7 @@ class Page(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.base = base
         self.chrome = 0
+        self._stack = []
         self.title = ""
         self._in_title = False
         self.h1 = ""
@@ -72,7 +100,14 @@ class Page(HTMLParser):
                     self.all_links.add(u)
                     if not self.chrome:
                         self.links.add(u)
+        chrome = False
         if tag in CHROME_TAGS:
+            chrome = True
+        elif tag in CHROME_CONTAINERS and is_chrome_attrs(a):
+            chrome = True
+        if tag not in VOID_TAGS:
+            self._stack.append((tag, chrome))
+        if chrome:
             self.chrome += 1
             return
         if tag == "title":
@@ -87,8 +122,16 @@ class Page(HTMLParser):
             self._flush()
 
     def handle_endtag(self, tag):
-        if tag in CHROME_TAGS:
-            self.chrome = max(0, self.chrome - 1)
+        closed_chrome = False
+        if any(t == tag for t, _ in self._stack):
+            while self._stack:
+                t, was_chrome = self._stack.pop()
+                if was_chrome:
+                    self.chrome = max(0, self.chrome - 1)
+                    closed_chrome = True
+                if t == tag:
+                    break
+        if closed_chrome or tag in CHROME_TAGS:
             return
         if tag == "title":
             self._in_title = False
@@ -163,6 +206,26 @@ def sentences(text):
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
+# Breadcrumb trails and menu strips survive chrome stripping on plenty of themes,
+# and they match a target's subject perfectly — while being useless as anchors.
+BREADCRUMB = re.compile(r"\s(/|»|›|→|\|)\s")
+
+
+def is_prose(s):
+    """Reject navigation debris that happens to contain the right words."""
+    if BREADCRUMB.search(s):
+        return False
+    w = s.split()
+    if len(w) < 5:
+        return False
+    # Menu strips are mostly capitalised labels; real sentences are mostly not.
+    capped = sum(1 for x in w if x[:1].isupper())
+    if capped / float(len(w)) > 0.6:
+        return False
+    # A sentence with no lowercase run of any length is a label, not prose.
+    return bool(re.search(r"[a-z]{3,}", s))
+
+
 def read_source(src, timeout=30):
     if not src.startswith(("http://", "https://")):
         with open(src, "rb") as f:
@@ -218,7 +281,7 @@ def find_opportunities(pages, min_terms, max_per_target):
                 continue
             best = None
             for s in source["sentences"]:
-                if len(words(s)) > MAX_ANCHOR_WORDS:
+                if len(words(s)) > MAX_ANCHOR_WORDS or not is_prose(s):
                     continue
                 sset = set(terms(s))
                 if not tset.issubset(sset):
@@ -247,10 +310,13 @@ def find_opportunities(pages, min_terms, max_per_target):
 
 
 def orphans(pages, inbound):
-    return sorted(p["url"] for p in pages if inbound.get(p["url"], 0) == 0)
+    """Normalised URLs are comparison keys — protocol-relative and ugly. Always
+    show the URL the crawl actually fetched."""
+    return sorted(p["raw_url"] for p in pages if inbound.get(p["url"], 0) == 0)
 
 
 def render(pages, results, inbound, args):
+    disp = {p["url"]: p["raw_url"] for p in pages}
     total_links = sum(len([l for l in p["all_links"] if l in {q["url"] for q in pages}])
                       for p in pages)
     orph = orphans(pages, inbound)
@@ -277,13 +343,13 @@ def render(pages, results, inbound, args):
         if shown >= args.limit:
             break
         shown += 1
-        print("  → %s" % r["target"])
+        print("  → %s" % disp.get(r["target"], r["target"]))
         print("    subject: %s   (%d inbound link%s, %d opportunit%s found)"
               % (r["subject"][:60], r["inbound_links"], "" if r["inbound_links"] == 1 else "s",
                  r["total_found"], "y" if r["total_found"] == 1 else "ies"))
         for o in r["opportunities"]:
             mark = "exact phrase" if o["exact_phrase"] else "topic match"
-            print("      from %s  [%s]" % (o["source"], mark))
+            print("      from %s  [%s]" % (disp.get(o["source"], o["source"]), mark))
             print("        \"%s\"" % o["sentence"][:120])
         print()
     if len(results) > args.limit:
@@ -341,6 +407,18 @@ def selftest():
     res3, _ = find_opportunities([target, long_sentence], MIN_TERMS, 5)
     ok("over-long sentence is not offered as an anchor",
        not any(o["source"] == "/e" for r in res3 for o in r["opportunities"]))
+
+    ok("breadcrumb rejected as an anchor",
+       not is_prose("Home / Cross-Industry / Water Filters For Hiking"))
+    ok("menu strip rejected as an anchor",
+       not is_prose("Water Filters Sleeping Bags Stoves Tents Packs Boots"))
+    ok("real prose accepted as an anchor",
+       is_prose("We carry a water filter for hiking on every trip."))
+    crumb = dict(opportunity, url="/f",
+                 sentences=["Home / Guides / Water Filters For Hiking Reviews"])
+    res4, _ = find_opportunities([target, crumb], MIN_TERMS, 5)
+    ok("breadcrumb page yields no opportunity",
+       not any(o["source"] == "/f" for r in res4 for o in r["opportunities"]))
 
     w = max(len(c[0]) for c in checks) + 2
     for l, passed in checks:
@@ -414,6 +492,11 @@ def main():
 
     results, inbound = find_opportunities(pages, args.min_terms, args.per_target)
     if args.json:
+        disp = {p["url"]: p["raw_url"] for p in pages}
+        for r in results:
+            r["target"] = disp.get(r["target"], r["target"])
+            for o in r["opportunities"]:
+                o["source"] = disp.get(o["source"], o["source"])
         json.dump({"pages": len(pages), "orphans": orphans(pages, inbound),
                    "targets": results}, sys.stdout, indent=2)
         print()
